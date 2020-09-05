@@ -4,10 +4,30 @@
 #define MAX_INPUTS 4
 #define MESSAGE_LENGTH (MAX_INPUTS + MESSAGE_HEADER_SIZE)
 #define BUFFER_SIZE (MESSAGE_LENGTH * 2)
-#define INPUT_THRESHOLD 95
-#define INPUT_RELEASE_THRESHOLD 55
+//#define TEST_FILE_MODE
+#ifdef TEST_FILE_MODE
+#include <stdio.h>
+#endif
+
 NTSTATUS(__stdcall *NtDelayExecution)(BOOL Alertable, PLARGE_INTEGER DelayInterval);
 NTSTATUS(__stdcall *ZwSetTimerResolution)(IN ULONG RequestedResolution, IN BOOLEAN Set, OUT PULONG ActualResolution);
+
+#ifdef TEST_FILE_MODE
+FILE* outFile = NULL;
+int fileWrites = 0;
+void writeToFile(const void *bytes) { //Pass in a byte for each input.
+	if (!outFile && fileWrites < 10000) { //No more than ~10 seconds of data
+		fopen_s(&outFile, "test.bin", "wb");
+	}
+	else if (outFile && fileWrites == 10000) {
+		fclose(outFile);
+	}
+
+	if (outFile) {
+		fwrite(bytes, MAX_INPUTS, 1, outFile);
+	}
+}
+#endif
 
 int focusedInStepMania() {
 	HWND foregroundWindow = GetForegroundWindow();
@@ -83,6 +103,9 @@ typedef struct INPUT_STATE {
 	byte lastVal; //ArdVrKs (C#) uses an array so you can look at the differential. I may want to do that here, too, but getting the release timing perfect isn't as important (and my FSRs are rated for a 15ms release anyway, or 66.67 times per second per arrow...that's a big physical no).
 	byte state;
 	byte stateSimulated;
+
+	byte pressThreshold;
+	byte releaseThreshold;
 } INPUT_STATE;
 
 void updateInputState(INPUT_STATE *input, byte newVal) {
@@ -91,7 +114,7 @@ void updateInputState(INPUT_STATE *input, byte newVal) {
 	//Determine new state
 	if (input->state == 0) //Not pressed
 	{
-		if (input->lastVal >= INPUT_THRESHOLD) input->state = 1;
+		if (input->lastVal >= input->pressThreshold) input->state = 1;
 	}
 	else if (input->state == 1) //Just pressed
 	{
@@ -99,7 +122,7 @@ void updateInputState(INPUT_STATE *input, byte newVal) {
 	}
 	else if (input->state == 2) //Held
 	{
-		if (input->lastVal <= INPUT_RELEASE_THRESHOLD) input->state = 3;
+		if (input->lastVal <= input->releaseThreshold) input->state = 3;
 	}
 	else if (input->state == 3) //Just released
 	{
@@ -119,8 +142,17 @@ void main() {
 	int bufferBytesFilled = 0;
 	int recentlyReadBytes = 0;
 
+	SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS); //Accurate timing is more important than other processes if you're playing a game anyway. :)
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
 	//Prepare my four input states, in the same order as the pressure data in the incoming messages
-	INPUT_STATE inputs[MAX_INPUTS] = { {.vkey = 'E'}, {.vkey = 'A'}, {.vkey = 'O'}, {.vkey = VK_OEM_COMMA} }; //Dvorak equivalent of DASW
+	INPUT_STATE inputs[MAX_INPUTS] = {
+		{.vkey = 'E', .pressThreshold = 0xB0, .releaseThreshold = 0xA7}, //Right
+		{.vkey = 'A', .pressThreshold = 0xC0, .releaseThreshold = 0xB7}, //Left
+		{.vkey = 'O', .pressThreshold = 0xB0, .releaseThreshold = 0xA7}, //Down
+		{.vkey = VK_OEM_COMMA, .pressThreshold = 0xA0, .releaseThreshold = 0x97} //Up
+	}; //Dvorak equivalent of DASW
+	//TODO: Instantaneous thresholds aren't going to work well; I need to use the delta, but even then, all of them drop at once when you press two arrows due to my added pressure... Maybe I can drop the press threshold when you start pressing an arrow. I should definitely also get higher-resistance resistors (probably about 10k ohms) to separate the inputs from each other and from ground.
 
 	while (1) { //TODO: Maybe don't loop forever. I might make a C# UI that starts and stops this daemon gracefully...
 		while (serialPort == INVALID_HANDLE_VALUE) {
@@ -169,10 +201,15 @@ void main() {
 				updateInputState(&inputs[x], buffer[x + MESSAGE_HEADER_SIZE]);
 			}
 
+#ifdef TEST_FILE_MODE
+			writeToFile(buffer + MESSAGE_HEADER_SIZE); //Write those same bytes to a file
+#endif
+
 			//Rotate the consumed data out of the buffer
 			bufferBytesFilled -= MESSAGE_LENGTH;
 			memmove(buffer, buffer + MESSAGE_LENGTH, bufferBytesFilled);
 
+#ifndef TEST_FILE_MODE
 			if (focusedInStepMania()) {
 				//Send simulated input events where the button simulated state doesn't (essentially) match the current state
 				for (int x = 0; x < MAX_INPUTS; x++)
@@ -187,7 +224,7 @@ void main() {
 					}
 				}
 			}
-
+#endif
 			//The delay here actually isn't necessary as long as ReadFile has a nonzero timeout.
 			microsleep(500); //500 microseconds = half a millisecond = very slightly below 2k executions per second (depends on the time it takes to execute)
 		}
