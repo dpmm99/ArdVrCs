@@ -147,10 +147,10 @@ void main() {
 
 	//Prepare my four input states, in the same order as the pressure data in the incoming messages
 	INPUT_STATE inputs[MAX_INPUTS] = {
-		{.vkey = 'E', .pressThreshold = 0xB0, .releaseThreshold = 0xA7}, //Right
-		{.vkey = 'A', .pressThreshold = 0xC0, .releaseThreshold = 0xB7}, //Left
-		{.vkey = 'O', .pressThreshold = 0xB0, .releaseThreshold = 0xA7}, //Down
-		{.vkey = VK_OEM_COMMA, .pressThreshold = 0xA0, .releaseThreshold = 0x97} //Up
+		{.vkey = 'E', .pressThreshold = 0x77, .releaseThreshold = 0x70}, //Right
+		{.vkey = 'A', .pressThreshold = 0x70, .releaseThreshold = 0x68}, //Left
+		{.vkey = 'O', .pressThreshold = 0x60, .releaseThreshold = 0x55}, //Down
+		{.vkey = VK_OEM_COMMA, .pressThreshold = 0x42, .releaseThreshold = 0x3B} //Up
 	}; //Dvorak equivalent of DASW
 	//TODO: Instantaneous thresholds aren't going to work well; I need to use the delta, but even then, all of them drop at once when you press two arrows due to my added pressure... Maybe I can drop the press threshold when you start pressing an arrow. I should definitely also get higher-resistance resistors (probably about 10k ohms) to separate the inputs from each other and from ground.
 
