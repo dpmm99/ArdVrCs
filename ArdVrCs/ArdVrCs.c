@@ -4,16 +4,18 @@
 #define MAX_INPUTS 4
 #define MESSAGE_LENGTH (MAX_INPUTS + MESSAGE_HEADER_SIZE)
 #define BUFFER_SIZE (MESSAGE_LENGTH * 2)
+#define BYTES_PER_INPUT_CONFIG 3
+#define CONFIG_FILE_SIZE (MAX_INPUTS * BYTES_PER_INPUT_CONFIG)
 //#define TEST_FILE_MODE
-#ifdef TEST_FILE_MODE
 #include <stdio.h>
-#endif
+#include <time.h>
+#include <conio.h>
 
 NTSTATUS(__stdcall *NtDelayExecution)(BOOL Alertable, PLARGE_INTEGER DelayInterval);
 NTSTATUS(__stdcall *ZwSetTimerResolution)(IN ULONG RequestedResolution, IN BOOLEAN Set, OUT PULONG ActualResolution);
 
 #ifdef TEST_FILE_MODE
-FILE* outFile = NULL;
+FILE *outFile = NULL;
 int fileWrites = 0;
 void writeToFile(const void *bytes) { //Pass in a byte for each input.
 	if (!outFile && fileWrites < 10000) { //No more than ~10 seconds of data
@@ -99,7 +101,7 @@ HANDLE openSerial() {
 }
 
 typedef struct INPUT_STATE {
-	WORD vkey;
+	byte vkey; //vkey is a WORD (unsigned short) but the documentation says it has to be between 0 and 254 inclusive
 	byte lastVal; //ArdVrKs (C#) uses an array so you can look at the differential. I may want to do that here, too, but getting the release timing perfect isn't as important (and my FSRs are rated for a 15ms release anyway, or 66.67 times per second per arrow...that's a big physical no).
 	byte state;
 	byte stateSimulated;
@@ -130,7 +132,189 @@ void updateInputState(INPUT_STATE *input, byte newVal) {
 	}
 }
 
-void main() {
+void loadConfig(INPUT_STATE *inputs) {
+	//Open config file
+	FILE *inFile;
+	errno_t openError;
+	if (openError = fopen_s(&inFile, "config.bin", "rb")) {
+		switch (openError) {
+		case ENOENT: //https://docs.microsoft.com/en-us/cpp/c-runtime-library/errno-doserrno-sys-errlist-and-sys-nerr?view=msvc-160
+			printf("config.bin not found. Using default keys and thresholds.\n");
+			break;
+		default:
+			printf("Unknown error %d when opening config.bin. Using default configuration.\n", openError);
+		}
+		return;
+	}
+
+	//Read config file
+	byte buffer[CONFIG_FILE_SIZE];
+	size_t bytes_read;
+	bytes_read = fread(buffer, sizeof(byte), CONFIG_FILE_SIZE, inFile);
+	if (bytes_read < CONFIG_FILE_SIZE) {
+		printf("Unexpected end of file. Using default thresholds.\n");
+		fclose(inFile);
+		return;
+	}
+
+	fclose(inFile);
+
+	//Apply config
+	for (int x = 0; x < MAX_INPUTS; x++) {
+		inputs[x].vkey = buffer[x * BYTES_PER_INPUT_CONFIG];
+		inputs[x].pressThreshold = buffer[x * BYTES_PER_INPUT_CONFIG + 1];
+		inputs[x].releaseThreshold = buffer[x * BYTES_PER_INPUT_CONFIG + 2];
+	}
+
+	printf("Configuration loaded.\n");
+}
+
+void saveConfig(INPUT_STATE *inputs) {
+	//Make backup if the file exists. (Fails silently, but just about the only error case in which it may lead to the old config.bin being lost is when the file path is too long.)
+	char backupFilename[32];
+	time_t now = time(NULL);
+	struct tm nowLocal;
+	localtime_s(&nowLocal, &now);
+	strftime(backupFilename, sizeof(backupFilename), "config_%Y-%m-%d_%H-%M-%S.bin", &nowLocal);
+	rename("config.bin", backupFilename);
+
+	//Create config file
+	FILE *outFile;
+	errno_t openError;
+	if (openError = fopen_s(&outFile, "config.bin", "wb")) {
+		switch (openError) {
+		case EROFS: //https://docs.microsoft.com/en-us/cpp/c-runtime-library/errno-doserrno-sys-errlist-and-sys-nerr?view=msvc-160
+			printf("Filesystem appears to be read-only. Cannot save config.bin.\n");
+			break;
+		default:
+			printf("Unknown error %d when creating file. Cannot save config.bin.\n", openError);
+		}
+		return;
+	}
+
+	//Save config
+	for (int x = 0; x < MAX_INPUTS; x++) {
+		fwrite(&inputs[x].vkey, sizeof(byte), 1, outFile);
+		fwrite(&inputs[x].pressThreshold, sizeof(byte), 1, outFile);
+		fwrite(&inputs[x].releaseThreshold, sizeof(byte), 1, outFile);
+	}
+
+	fclose(outFile);
+
+	printf("Configuration saved.\n");
+}
+
+char *getNameFromVirtualKey(byte vkey) {
+	static char keyName[32] = { 0 }; //Not thread safe. :)
+	WORD scanCode = MapVirtualKey(vkey, 0);
+
+	//"because MapVirtualKey strips the extended bit for some keys", according to http://www.setnode.com/blog/mapvirtualkey-getkeynametext-and-a-story-of-how-to/
+	switch (vkey)
+	{
+	case VK_LEFT: case VK_UP: case VK_RIGHT: case VK_DOWN:
+	case VK_PRIOR: case VK_NEXT: //Page up/down
+	case VK_END: case VK_HOME:
+	case VK_INSERT: case VK_DELETE:
+	case VK_DIVIDE: //Numpad slash
+	case VK_NUMLOCK:
+		scanCode |= 0x100; //Set 'extended' flag bit
+	}
+
+	GetKeyNameText(scanCode << 16, keyName, sizeof(keyName));
+
+	return keyName;
+}
+
+void continueCalibrating(int *calibrating, INPUT_STATE *inputs) {
+	static byte minima[MAX_INPUTS] = { 0 };
+	static byte maxima[MAX_INPUTS] = { 0 };
+	static byte displayCharIndexes[MAX_INPUTS] = { 0 };
+	int x;
+
+	//Calibrate and update inputs. then calculate the final numbers, then let them test it out, and if they press escape, restart calibration, and if they press any other key, save the file and end calibration mode.
+	(*calibrating)++; //Updated up to about 2000 times per second in theory, but the Arduino program is set to closer to half of that
+	if ((*calibrating >= 100 && *calibrating < 1000) || (*calibrating >= 4000 && *calibrating < 5000) || (*calibrating >= 8000 && *calibrating < 9000)) { //Dead zones from 1 to 100, 1000 to 4000, etc. to avoid reading garbage inputs and to give the user time to move
+		if (*calibrating == 100 || *calibrating == 4000 || *calibrating == 8000) { //Reset the minima to the max value and the maxima to the min value before each recording
+			memset(minima, 255, sizeof(minima));
+			memset(maxima, 0, sizeof(maxima));
+		}
+
+		for (x = 0; x < MAX_INPUTS; x++) {
+			if (minima[x] > inputs[x].lastVal) minima[x] = inputs[x].lastVal;
+			if (maxima[x] < inputs[x].lastVal) maxima[x] = inputs[x].lastVal;
+		}
+	}
+	else if (*calibrating == 1000) {
+		//Save the maxima as tentative release thresholds
+		for (x = 0; x < MAX_INPUTS; x++) inputs[x].releaseThreshold = maxima[x];
+
+		printf("Please quickly stand on the left and right arrows and wait a few seconds.\n");
+	}
+	else if (*calibrating == 5000) { //These two blocks are going to be totally wrong if you set up the inputs in a different order. :P
+		inputs[0].pressThreshold = minima[0]; //Right
+		inputs[1].pressThreshold = minima[1]; //Left
+		if (maxima[2] > inputs[2].releaseThreshold) inputs[2].releaseThreshold = maxima[2]; //Down
+		if (maxima[3] > inputs[3].releaseThreshold) inputs[3].releaseThreshold = maxima[3]; //Up
+
+		printf("Please quickly stand on the up and down arrows and wait a few seconds.\n");
+	}
+	else if (*calibrating == 9000) {
+		if (maxima[0] > inputs[0].releaseThreshold) inputs[0].releaseThreshold = maxima[0]; //Right
+		if (maxima[1] > inputs[1].releaseThreshold) inputs[1].releaseThreshold = maxima[1]; //Left
+		inputs[2].pressThreshold = minima[2]; //Down
+		inputs[3].pressThreshold = minima[3]; //Up
+
+		//Now we have measured actual press/release thresholds, but we can drop the press threshold down if it's much higher than the release threshold, and it might even be okay for us to push the release threshold down!
+		for (x = 0; x < MAX_INPUTS; x++) {
+			if ((int)inputs[x].pressThreshold > (int)inputs[x].releaseThreshold + 5) inputs[x].pressThreshold = inputs[x].releaseThreshold + 1;
+			else if (inputs[x].releaseThreshold > 5) { //They're already pretty close together; let's try to gain some leeway by moving the release threshold down a bit, even if it causes the release to be delayed a few milliseconds due to static electricity--I find it unlikely that two notes on the same arrow will ever need to be played under 30ms apart (64th note at 300 BPM)
+				inputs[x].releaseThreshold -= 5;
+				inputs[x].pressThreshold -= 5;
+			}
+		}
+
+		printf("Calibration results: ");
+		for (x = 0; x < MAX_INPUTS; x++) {
+			printf("key %s: %d/%d%s", getNameFromVirtualKey(inputs[x].vkey), inputs[x].pressThreshold, inputs[x].releaseThreshold, x < MAX_INPUTS - 1 ? ", " : "");
+		}
+
+		//Set character indexes for displaying a symbol when an arrow is stepped on
+		displayCharIndexes[0] = 14; //Right
+		displayCharIndexes[1] = 2; //Left
+		displayCharIndexes[2] = 6; //Down
+		displayCharIndexes[3] = 10; //Up
+		printf("Step on the arrows to test the calibration results, then step off and press escape to restart calibration or any other key to save and continue.\nL   D   U   R   "); //No ending linefeed, so we can use absolute horizontal positioning commands to quickly update the display
+	}
+	else if (*calibrating == 9001) {
+		//Display what inputs are currently being pressed
+		for (x = 0; x < MAX_INPUTS; x++) {
+			if ((inputs[x].state == 1 || inputs[x].state == 2) && inputs[x].stateSimulated != 1) {
+				printf("\x1b[%dGX", displayCharIndexes[x]); //Horizontal positioning character code sequence: ESC [ <n> G
+				inputs[x].stateSimulated = 1;
+			}
+			else if ((inputs[x].state == 0 || inputs[x].state == 3) && inputs[x].stateSimulated == 1) {
+				printf("\x1b[%dG ", displayCharIndexes[x]); //Clear the X
+				inputs[x].stateSimulated = 0;
+			}
+		}
+
+		//Wait for the user to either hold escape to restart calibration or any other key to save the config and end calibration mode
+		if (_kbhit()) {
+			if (_getch() == 27) { //Escape key
+				*calibrating = 1;
+				printf("\nRestarting calibration...\n");
+			}
+			else {
+				printf("\nSaving calibration data...\n");
+				saveConfig(inputs);
+				*calibrating = 0;
+			}
+		}
+		else (*calibrating)--;
+	}
+}
+
+void main(int argc, char *argv[]) {
 	//Get function addresses from ntdll so we can use timers with extreme accuracy instead of 'sleep', which likes to jump either 0ms or 17ms every time in my experience (although I've read that the default Windows quantum is 15ms).
 	//Don't forget to set this thread to real-time priority in order to keep the timing as close to perfect as possible. This may actually end up being more accurate than StepMania itself, for all I know...
 	NtDelayExecution = (NTSTATUS(__stdcall*)(BOOL, PLARGE_INTEGER)) GetProcAddress(GetModuleHandle("ntdll.dll"), "NtDelayExecution");
@@ -141,6 +325,7 @@ void main() {
 	byte buffer[BUFFER_SIZE] = { 0 };
 	int bufferBytesFilled = 0;
 	int recentlyReadBytes = 0;
+	int calibrating = 0;
 
 	SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS); //Accurate timing is more important than other processes if you're playing a game anyway. :)
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -148,10 +333,17 @@ void main() {
 	//Prepare my four input states, in the same order as the pressure data in the incoming messages
 	INPUT_STATE inputs[MAX_INPUTS] = {
 		{.vkey = 'E', .pressThreshold = 0x77, .releaseThreshold = 0x70}, //Right
-		{.vkey = 'A', .pressThreshold = 0x70, .releaseThreshold = 0x68}, //Left
+		{.vkey = 'A', .pressThreshold = 0x6D, .releaseThreshold = 0x66}, //Left
 		{.vkey = 'O', .pressThreshold = 0x60, .releaseThreshold = 0x55}, //Down
-		{.vkey = VK_OEM_COMMA, .pressThreshold = 0x42, .releaseThreshold = 0x3B} //Up
+		{.vkey = VK_OEM_COMMA, .pressThreshold = 0x3D, .releaseThreshold = 0x37} //Up
 	}; //Dvorak equivalent of DASW
+	loadConfig(inputs);
+
+	if (argc > 1 && argv[1][0] && (!_strcmpi(argv[1], "calibrate") || !_strcmpi(&argv[1][1], "calibrate"))) //Allow "calibrate" or "-calibrate" or "/calibrate" or even "ncalibrate" so it doesn't matter what the user is used to. :P
+	{
+		calibrating = 1;
+	}
+
 	//TODO: Instantaneous thresholds aren't going to work well; I need to use the delta, but even then, all of them drop at once when you press two arrows due to my added pressure... Maybe I can drop the press threshold when you start pressing an arrow. I should definitely also get higher-resistance resistors (probably about 10k ohms) to separate the inputs from each other and from ground.
 
 	while (1) { //TODO: Maybe don't loop forever. I might make a C# UI that starts and stops this daemon gracefully...
@@ -210,7 +402,8 @@ void main() {
 			memmove(buffer, buffer + MESSAGE_LENGTH, bufferBytesFilled);
 
 #ifndef TEST_FILE_MODE
-			if (focusedInStepMania()) {
+			if (calibrating) continueCalibrating(&calibrating, inputs);
+			else if (focusedInStepMania()) {
 				//Send simulated input events where the button simulated state doesn't (essentially) match the current state
 				for (int x = 0; x < MAX_INPUTS; x++)
 				{
