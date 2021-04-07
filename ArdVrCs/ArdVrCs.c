@@ -232,9 +232,9 @@ void continueCalibrating(int *calibrating, INPUT_STATE *inputs) {
 	int x;
 
 	//Calibrate and update inputs. then calculate the final numbers, then let them test it out, and if they press escape, restart calibration, and if they press any other key, save the file and end calibration mode.
-	(*calibrating)++; //Updated up to about 2000 times per second in theory, but the Arduino program is set to closer to half of that
-	if ((*calibrating >= 100 && *calibrating < 1000) || (*calibrating >= 4000 && *calibrating < 5000) || (*calibrating >= 8000 && *calibrating < 9000)) { //Dead zones from 1 to 100, 1000 to 4000, etc. to avoid reading garbage inputs and to give the user time to move
-		if (*calibrating == 100 || *calibrating == 4000 || *calibrating == 8000) { //Reset the minima to the max value and the maxima to the min value before each recording
+	(*calibrating)++; //Should be updated up to about 2000 times per second; in reality, it seems to be closer to 700x~800x
+	if ((*calibrating >= 100 && *calibrating < 2000) || (*calibrating >= 8000 && *calibrating < 10000) || (*calibrating >= 16000 && *calibrating < 18000)) { //Dead zones from 1 to 100, 1000 to 4000, etc. to avoid reading garbage inputs and to give the user time to move
+		if (*calibrating == 100 || *calibrating == 8000 || *calibrating == 16000) { //Reset the minima to the max value and the maxima to the min value before each recording
 			memset(minima, 255, sizeof(minima));
 			memset(maxima, 0, sizeof(maxima));
 		}
@@ -243,14 +243,19 @@ void continueCalibrating(int *calibrating, INPUT_STATE *inputs) {
 			if (minima[x] > inputs[x].lastVal) minima[x] = inputs[x].lastVal;
 			if (maxima[x] < inputs[x].lastVal) maxima[x] = inputs[x].lastVal;
 		}
+
+		if ((*calibrating & 0xff) == 0x00 && *calibrating > 2000) { //Give an occasional visual update on the time you have to keep standing on the arrows
+			if (*calibrating < 10000) printf("\r%d...   \r", ((10000 - *calibrating) >> 9) + 1);
+			else if (*calibrating < 18000) printf("\r%d...   \r", ((18000 - *calibrating) >> 9) + 1);
+		}
 	}
-	else if (*calibrating == 1000) {
+	else if (*calibrating == 2000) {
 		//Save the maxima as tentative release thresholds
 		for (x = 0; x < MAX_INPUTS; x++) inputs[x].releaseThreshold = maxima[x];
 
 		printf("Please quickly stand on the left and right arrows and wait a few seconds.\n");
 	}
-	else if (*calibrating == 5000) { //These two blocks are going to be totally wrong if you set up the inputs in a different order. :P
+	else if (*calibrating == 10000) { //These two blocks are going to be totally wrong if you set up the inputs in a different order. :P
 		inputs[0].pressThreshold = minima[0]; //Right
 		inputs[1].pressThreshold = minima[1]; //Left
 		if (maxima[2] > inputs[2].releaseThreshold) inputs[2].releaseThreshold = maxima[2]; //Down
@@ -258,7 +263,7 @@ void continueCalibrating(int *calibrating, INPUT_STATE *inputs) {
 
 		printf("Please quickly stand on the up and down arrows and wait a few seconds.\n");
 	}
-	else if (*calibrating == 9000) {
+	else if (*calibrating == 18000) {
 		if (maxima[0] > inputs[0].releaseThreshold) inputs[0].releaseThreshold = maxima[0]; //Right
 		if (maxima[1] > inputs[1].releaseThreshold) inputs[1].releaseThreshold = maxima[1]; //Left
 		inputs[2].pressThreshold = minima[2]; //Down
@@ -285,18 +290,21 @@ void continueCalibrating(int *calibrating, INPUT_STATE *inputs) {
 		displayCharIndexes[3] = 10; //Up
 		printf("Step on the arrows to test the calibration results, then step off and press escape to restart calibration or any other key to save and continue.\nL   D   U   R   "); //No ending linefeed, so we can use absolute horizontal positioning commands to quickly update the display
 	}
-	else if (*calibrating == 9001) {
+	else if (*calibrating == 18001) {
 		//Display what inputs are currently being pressed
-		for (x = 0; x < MAX_INPUTS; x++) {
-			if ((inputs[x].state == 1 || inputs[x].state == 2) && inputs[x].stateSimulated != 1) {
-				printf("\x1b[%dGX", displayCharIndexes[x]); //Horizontal positioning character code sequence: ESC [ <n> G
-				inputs[x].stateSimulated = 1;
-			}
-			else if ((inputs[x].state == 0 || inputs[x].state == 3) && inputs[x].stateSimulated == 1) {
-				printf("\x1b[%dG ", displayCharIndexes[x]); //Clear the X
-				inputs[x].stateSimulated = 0;
-			}
-		}
+		printf("\r  %s   %s   %s   %s", inputs[1].state ? "X" : " ", inputs[2].state ? "X" : " ", inputs[3].state ? "X" : " ", inputs[0].state ? "X" : " ");
+
+		//Could switch this to use the SetConsoleCursorPosition API to be compatible with Windows <10, but opted to just use \r as a quick fix because this computer is dying
+		//for (x = 0; x < MAX_INPUTS; x++) {
+			//if ((inputs[x].state == 1 || inputs[x].state == 2) && inputs[x].stateSimulated != 1) {
+			//	printf("\x1b[%dGX", displayCharIndexes[x]); //Horizontal positioning character code sequence: ESC [ <n> G
+			//	inputs[x].stateSimulated = 1;
+			//}
+			//else if ((inputs[x].state == 0 || inputs[x].state == 3) && inputs[x].stateSimulated == 1) {
+			//	printf("\x1b[%dG ", displayCharIndexes[x]); //Clear the X
+			//	inputs[x].stateSimulated = 0;
+			//}
+		//}
 
 		//Wait for the user to either hold escape to restart calibration or any other key to save the config and end calibration mode
 		if (_kbhit()) {
@@ -314,6 +322,14 @@ void continueCalibrating(int *calibrating, INPUT_STATE *inputs) {
 	}
 }
 
+void displayRaw(int *counter, INPUT_STATE *inputs) {
+	if (++(*counter) == 10) { //Takes too long to update the terminal; wait a bit between display updates just to not back up the reads
+		*counter = 1;
+		//Raw input values
+		printf("\rL %3d D %3d U %3d R %3d \r", inputs[1].lastVal, inputs[2].lastVal, inputs[3].lastVal, inputs[0].lastVal);
+	}
+}
+
 void main(int argc, char *argv[]) {
 	//Get function addresses from ntdll so we can use timers with extreme accuracy instead of 'sleep', which likes to jump either 0ms or 17ms every time in my experience (although I've read that the default Windows quantum is 15ms).
 	//Don't forget to set this thread to real-time priority in order to keep the timing as close to perfect as possible. This may actually end up being more accurate than StepMania itself, for all I know...
@@ -326,6 +342,7 @@ void main(int argc, char *argv[]) {
 	int bufferBytesFilled = 0;
 	int recentlyReadBytes = 0;
 	int calibrating = 0;
+	int viewRaw = 0;
 
 	SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS); //Accurate timing is more important than other processes if you're playing a game anyway. :)
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -342,6 +359,12 @@ void main(int argc, char *argv[]) {
 	if (argc > 1 && argv[1][0] && (!_strcmpi(argv[1], "calibrate") || !_strcmpi(&argv[1][1], "calibrate"))) //Allow "calibrate" or "-calibrate" or "/calibrate" or even "ncalibrate" so it doesn't matter what the user is used to. :P
 	{
 		calibrating = 1;
+		printf("Prepare for calibration!\n");
+	}
+	else if (argc > 1 && argv[1][0] && (!_strcmpi(argv[1], "raw") || !_strcmpi(&argv[1][1], "raw"))) //Allow "raw" or "-raw" or "/raw" or even "grrraw" so it doesn't matter what the user is used to. :P
+	{
+		viewRaw = 1;
+		printf("Displaying raw input values.\n");
 	}
 
 	//TODO: Instantaneous thresholds aren't going to work well; I need to use the delta, but even then, all of them drop at once when you press two arrows due to my added pressure... Maybe I can drop the press threshold when you start pressing an arrow. I should definitely also get higher-resistance resistors (probably about 10k ohms) to separate the inputs from each other and from ground.
@@ -403,6 +426,7 @@ void main(int argc, char *argv[]) {
 
 #ifndef TEST_FILE_MODE
 			if (calibrating) continueCalibrating(&calibrating, inputs);
+			else if (viewRaw) displayRaw(&viewRaw, inputs);
 			else if (focusedInStepMania()) {
 				//Send simulated input events where the button simulated state doesn't (essentially) match the current state
 				for (int x = 0; x < MAX_INPUTS; x++)
