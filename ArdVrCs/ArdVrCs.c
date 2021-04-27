@@ -323,10 +323,20 @@ void continueCalibrating(int *calibrating, INPUT_STATE *inputs) {
 }
 
 void displayRaw(int *counter, INPUT_STATE *inputs) {
+	static LARGE_INTEGER ticks;
+	static LARGE_INTEGER freq;
 	if (++(*counter) == 10) { //Takes too long to update the terminal; wait a bit between display updates just to not back up the reads
 		*counter = 1;
+
+		//Calculate poll rate
+		if (ticks.QuadPart == 0) QueryPerformanceFrequency(&freq);
+		LARGE_INTEGER newTicks;
+		QueryPerformanceCounter(&newTicks);
+		int pollRate = (int)(10.0 * (double)freq.QuadPart / (double)(newTicks.QuadPart - ticks.QuadPart));
+		ticks = newTicks;
+
 		//Raw input values
-		printf("\rL %3d D %3d U %3d R %3d \r", inputs[1].lastVal, inputs[2].lastVal, inputs[3].lastVal, inputs[0].lastVal);
+		printf("\rL %3d D %3d U %3d R %3d @%3dHz   \r", inputs[1].lastVal, inputs[2].lastVal, inputs[3].lastVal, inputs[0].lastVal, pollRate);
 	}
 }
 
@@ -443,7 +453,7 @@ void main(int argc, char *argv[]) {
 			}
 #endif
 			//The delay here actually isn't necessary as long as ReadFile has a nonzero timeout.
-			microsleep(500); //500 microseconds = half a millisecond = very slightly below 2k executions per second (depends on the time it takes to execute)
+			//microsleep(500); //500 microseconds = half a millisecond = very slightly below 2k executions per second (depends on the time it takes to execute)
 		}
 	}
 
